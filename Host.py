@@ -31,9 +31,20 @@ class Host(SimulatedEntity):
         self._sw_current_pkt = None  # quel pacqet est actuellement en attente d'ACK
 
         # Retransmission timer (ACKNOWLEDGES WITH RETRANSMISSION)
-        self._sw_rto = 0.01
-        self._sw_timer_token = 0
-        
+        self._sw_rto = 0.01         # timeout de retransmission
+        self._sw_timer_token = 0    # token pour invalider les anciens timers
+
+        # Pipeling fixed window
+        self._pfw_window_size = 5     # taille de la fenêtre (fixe)
+        self._pfw_base = None         # SN du plus ancien paquet non acquitté
+        self._pfw_next = None         # prochain SN à envoyer
+        self._pfw_send_buf = {}       # paquets envoyés mais pas encore acquittés
+        self._pfw_app_queue = []      # paquets DATA à envoyer
+        self._pfw_rto = 0.01          # timeout de retransmission
+        self._pfw_timer_token = 0     # token pour invalider les anciens timers
+        self._pfw_expected = 1        # prochain SN attendu en ordre
+        self._pfw_recv_cache = {}     # paquet reçus (hors ordre)
+
     def add_nic(self, nic):
         assert nic.host() == None
         nic.set_host(self)
@@ -85,7 +96,142 @@ class Host(SimulatedEntity):
 
         if self._mode == ReliabilityMode.ACKNOWLEDGES_WITH_RETRANSMISSION:
             self._sw_start_timer(pkt.serial_number)
-    
+
+    def _pfw_start_timer(self):
+        if self._pfw_base is None:
+            return
+        
+        self._pfw_timer_token += 1
+        token = self._pfw_timer_token
+        base_sn = self._pfw_base
+        self.info(f'[PFW] timer started for base SN={base_sn} (RTO={self._pfw_rto})')
+
+        def _on_timeout():
+            self._pfw_on_timeout(token, base_sn)
+
+        self._sim.add_event(_TimeoutEvent(_on_timeout), self._pfw_rto)
+
+    def _pfw_stop_timer(self):
+        self._pfw_timer_token += 1
+        self.info(f'[PFW] timer stopped')
+
+    def _pfw_on_timeout(self, token: int, sn: int):
+        if token != self._pfw_timer_token:
+            return
+
+        if self._pfw_base is None:
+            return
+
+        if sn != self._pfw_base:
+            return
+
+        pkt = self._pfw_send_buf.get(self._pfw_base)
+        if pkt is None:
+            return
+
+        self.info(f'[PFW] timeout -> retransmit oldest unacked {pkt}')
+        self._nic.send(pkt)
+        self._pfw_start_timer()
+
+    def _pfw_fill_window(self):
+        # Remplit la fenêtre d'envoi tant que la fenêtre n'est pas pleine et qu'il reste des paquets à envoyer
+        if self._pfw_base is None:
+            # initialisation de la fenêtre du tout premier envoi
+            if not self._pfw_app_queue:
+                return
+            first_sn = self._pfw_app_queue[0].serial_number
+            self._pfw_base = first_sn
+            self._pfw_next = first_sn
+
+        while self._pfw_next is not None:
+            in_flight = len(self._pfw_send_buf)
+            if in_flight >= self._pfw_window_size:
+                return
+            if not self._pfw_app_queue:
+                return
+            
+            pkt = self._pfw_app_queue[0]
+            if pkt.serial_number != self._pfw_next:
+                return
+            
+            self._pfw_app_queue.pop(0)
+            self._pfw_send_buf[pkt.serial_number] = pkt
+
+            self.info(f'[PFW] sends {pkt} (window base={self._pfw_base}, next={self._pfw_next}, height={self._pfw_window_size})')
+            self._nic.send(pkt)
+
+            if len(self._pfw_send_buf) == 1:
+                self._pfw_start_timer()
+
+            self._pfw_next += 1
+
+    def _pfw_send_cum_ack(self):
+        # Envoi d'un ack pour la gestion de la fenêtre
+        ack_sn = self._pfw_expected - 1
+        ack = Packet(sn=ack_sn, size=10, type=PacketType.ACK)
+        self.info(f'[PFW] sends cumulative {ack} (ack up to SN={ack_sn})')
+        self._nic.send(ack)
+
+    def _pfw_on_data_received(self, pkt):
+        # si le paquet est attendu => on avance expected et on délivre aussi ceux en cache
+        # si paquet hors ordre => on le met en cache
+        # si duplicata => on ignore
+        # Puis on renvoie un ACK cumulatif.
+        sn = pkt.serial_number
+
+        if sn == self._pfw_expected:
+            # Paquet ACK reçu dans le bon ordre
+            self.info(f'[PFW] in-order DATA SN={sn} (expected={self._pfw_expected})')
+            self._pfw_expected += 1
+
+            while self._pfw_expected in self._pfw_recv_cache:
+                cached = self._pfw_recv_cache.pop(self._pfw_expected)
+                self.info(f'[PFW] deliver cached DATA SN={cached.serial_number}')
+                self._pfw_expected += 1
+
+        elif sn > self._pfw_expected:
+            # Paquet reçu hors ordre
+            if sn not in self._pfw_recv_cache:
+                self._pfw_recv_cache[sn] = pkt
+                self.info(f'[PFW] out-of-order DATA SN={sn} cached (expected={self._pfw_expected})')
+
+        else:
+            # Paquet ACK duplicata
+            self.info(f'[PFW] duplicate DATA SN={sn} ignored (expected={self._pfw_expected})')
+
+        self._pfw_send_cum_ack()
+
+    def _pfw_on_ack_received(self, pkt):
+        # Gestion de la fenêtre, du buffer et du timer
+        ack_sn = pkt.serial_number
+        if self._pfw_base is None:
+            return
+
+        if ack_sn < self._pfw_base - 1:
+            self.info(f'[PFW] old ACK SN={ack_sn} ignored (base={self._pfw_base})')
+            return
+
+        newly_acked = [sn for sn in self._pfw_send_buf.keys() if sn <= ack_sn]
+        if not newly_acked:
+            self.info(f'[PFW] ACK SN={ack_sn} received (no new acked) (base={self._pfw_base})')
+            return
+
+        for sn in sorted(newly_acked):
+            self._pfw_send_buf.pop(sn, None)
+
+        old_base = self._pfw_base
+        self._pfw_base = ack_sn + 1
+        self.info(f'[PFW] cumulative ACK up to SN={ack_sn} -> slide window (base {old_base} -> {self._pfw_base})')
+
+        if len(self._pfw_send_buf) == 0:
+            self._pfw_stop_timer()
+            self._pfw_base = None
+            self._pfw_next = None
+        else:
+            self._pfw_start_timer()
+
+        self._pfw_fill_window()
+
     def receive(self, nic, pkt):
         assert nic == self._nic
         self.info(f'received {pkt} on {nic}')
@@ -116,6 +262,13 @@ class Host(SimulatedEntity):
                         self.info(f'[SW] received unexpected ACK SN={pkt.serial_number} (ignored)')
             
                 return
+        
+        if self._mode == ReliabilityMode.PIPELINING_FIXED_WINDOW:
+            if pkt.type == PacketType.DATA:
+                self._pfw_on_data_received(pkt)   # receiver side: cache + ACK cumulatif
+            elif pkt.type == PacketType.ACK:
+                self._pfw_on_ack_received(pkt)    # sender side: slide window
+            return  
     
     def send(self, pkts):
         if self._mode == ReliabilityMode.NO_RELIABILITY:
@@ -126,6 +279,10 @@ class Host(SimulatedEntity):
         elif self._mode in (ReliabilityMode.ACKNOWLEDGES, ReliabilityMode.ACKNOWLEDGES_WITH_RETRANSMISSION):
             self._sw_send_queue.extend(pkts)
             self._sw_try_send_next()
+
+        elif self._mode == ReliabilityMode.PIPELINING_FIXED_WINDOW:
+            self._pfw_app_queue.extend(pkts)
+            self._pfw_fill_window()
 
         else:
             raise NotImplementedError('This reliability mode is not yet implemented.')
