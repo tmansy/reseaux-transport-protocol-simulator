@@ -34,7 +34,7 @@ class Host(SimulatedEntity):
         self._sw_rto = 0.01         # timeout de retransmission
         self._sw_timer_token = 0    # token pour invalider les anciens timers
 
-        # Pipeling fixed window
+        # Pipelining fixed window (PFW)
         self._pfw_window_size = 5     # taille de la fenêtre (fixe)
         self._pfw_base = None         # SN du plus ancien paquet non acquitté
         self._pfw_next = None         # prochain SN à envoyer
@@ -44,6 +44,17 @@ class Host(SimulatedEntity):
         self._pfw_timer_token = 0     # token pour invalider les anciens timers
         self._pfw_expected = 1        # prochain SN attendu en ordre
         self._pfw_recv_cache = {}     # paquet reçus (hors ordre)
+
+        # Pipelining dynamic window (PDW)
+        self._pdw_window_size = 1     # taille de la fenêtre initialisée à 1
+        self._pdw_base = None         # SN du plus ancien paquet non acquitté
+        self._pdw_next = None         # prochain SN à envoyer
+        self._pdw_send_buf = {}       # paquets envoyés mais pas encore acquittés
+        self._pdw_app_queue = []      # paquets DATA à envoyer
+        self._pdw_rto = 0.01          # timeout de retransmission
+        self._pdw_timer_token = 0     # token pour invalider les anciens timers
+        self._pdw_expected = 1        # prochain SN attendu en ordre
+        self._pdw_recv_cache = {}     # paquets reçus (hors-ordre)
 
     def add_nic(self, nic):
         assert nic.host() == None
@@ -232,6 +243,139 @@ class Host(SimulatedEntity):
 
         self._pfw_fill_window()
 
+    def _pdw_start_timer(self):
+        if self._pdw_base is None:
+            return
+
+        self._pdw_timer_token += 1
+        token = self._pdw_timer_token
+        base_sn = self._pdw_base
+        self.info(f'[PDW] timer started for base SN={base_sn} (RTO={self._pdw_rto})')
+
+        def _on_timeout():
+            self._pdw_on_timeout(token, base_sn)
+
+        self._sim.add_event(_TimeoutEvent(_on_timeout), self._pdw_rto)
+
+    def _pdw_stop_timer(self):
+        self._pdw_timer_token += 1
+        self.info(f'[PDW] timer stopped')
+
+    def _pdw_on_timeout(self, token: int, sn: int):
+        if token != self._pdw_timer_token:
+            return
+        if self._pdw_base is None:
+            return
+        if sn != self._pdw_base:
+            return
+
+        old_w = self._pdw_window_size
+        self._pdw_window_size = 1
+        self.info(f'[PDW] timeout -> window size {old_w} -> {self._pdw_window_size}')
+
+        # Retransmettre uniquement le plus ancien non acquitté
+        pkt = self._pdw_send_buf.get(self._pdw_base)
+        if pkt is None:
+            return
+
+        self.info(f'[PDW] timeout -> retransmit oldest unacked {pkt}')
+        self._nic.send(pkt)
+
+        # Redémarrer le timer
+        self._pdw_start_timer()
+
+    def _pdw_fill_window(self):
+        # Initialisation base/next au premier envoi
+        if self._pdw_base is None:
+            if not self._pdw_app_queue:
+                return
+            first_sn = self._pdw_app_queue[0].serial_number
+            self._pdw_base = first_sn
+            self._pdw_next = first_sn
+
+        while self._pdw_next is not None:
+            in_flight = len(self._pdw_send_buf)
+            if in_flight >= self._pdw_window_size:
+                return
+            if not self._pdw_app_queue:
+                return
+
+            pkt = self._pdw_app_queue[0]
+            if pkt.serial_number != self._pdw_next:
+                return
+
+            self._pdw_app_queue.pop(0)
+            self._pdw_send_buf[pkt.serial_number] = pkt
+
+            self.info(f'[PDW] sends {pkt} (base={self._pdw_base}, next={self._pdw_next}, W={self._pdw_window_size})')
+            self._nic.send(pkt)
+
+            if len(self._pdw_send_buf) == 1:
+                self._pdw_start_timer()
+
+            self._pdw_next += 1
+
+    def _pdw_send_cum_ack(self):
+        ack_sn = self._pdw_expected - 1
+        ack = Packet(sn=ack_sn, size=10, type=PacketType.ACK)
+        self.info(f'[PDW] sends cumulative {ack} (ack up to SN={ack_sn})')
+        self._nic.send(ack)
+
+    def _pdw_on_data_received(self, pkt):
+        sn = pkt.serial_number
+
+        if sn == self._pdw_expected:
+            self.info(f'[PDW] in-order DATA SN={sn} (expected={self._pdw_expected})')
+            self._pdw_expected += 1
+
+            while self._pdw_expected in self._pdw_recv_cache:
+                cached = self._pdw_recv_cache.pop(self._pdw_expected)
+                self.info(f'[PDW] deliver cached DATA SN={cached.serial_number}')
+                self._pdw_expected += 1
+
+        elif sn > self._pdw_expected:
+            if sn not in self._pdw_recv_cache:
+                self._pdw_recv_cache[sn] = pkt
+                self.info(f'[PDW] out-of-order DATA SN={sn} cached (expected={self._pdw_expected})')
+        else:
+            self.info(f'[PDW] duplicate DATA SN={sn} ignored (expected={self._pdw_expected})')
+
+        self._pdw_send_cum_ack()
+
+    def _pdw_on_ack_received(self, pkt):
+        ack_sn = pkt.serial_number
+        if self._pdw_base is None:
+            return
+
+        if ack_sn < self._pdw_base - 1:
+            self.info(f'[PDW] old ACK SN={ack_sn} ignored (base={self._pdw_base})')
+            return
+
+        newly_acked = [sn for sn in self._pdw_send_buf.keys() if sn <= ack_sn]
+        if not newly_acked:
+            self.info(f'[PDW] ACK SN={ack_sn} received (no new acked) (base={self._pdw_base})')
+            return
+
+        for sn in sorted(newly_acked):
+            self._pdw_send_buf.pop(sn, None)
+
+        old_w = self._pdw_window_size
+        self._pdw_window_size += 1
+        self.info(f'[PDW] ACK received -> window size {old_w} -> {self._pdw_window_size}')
+
+        old_base = self._pdw_base
+        self._pdw_base = ack_sn + 1
+        self.info(f'[PDW] cumulative ACK up to SN={ack_sn} -> slide window (base {old_base} -> {self._pdw_base})')
+
+        if len(self._pdw_send_buf) == 0:
+            self._pdw_stop_timer()
+            self._pdw_base = None
+            self._pdw_next = None
+        else:
+            self._pdw_start_timer()
+
+        self._pdw_fill_window()
+
     def receive(self, nic, pkt):
         assert nic == self._nic
         self.info(f'received {pkt} on {nic}')
@@ -265,11 +409,18 @@ class Host(SimulatedEntity):
         
         if self._mode == ReliabilityMode.PIPELINING_FIXED_WINDOW:
             if pkt.type == PacketType.DATA:
-                self._pfw_on_data_received(pkt)   # receiver side: cache + ACK cumulatif
+                self._pfw_on_data_received(pkt)
             elif pkt.type == PacketType.ACK:
-                self._pfw_on_ack_received(pkt)    # sender side: slide window
+                self._pfw_on_ack_received(pkt)
             return  
-    
+
+        if self._mode == ReliabilityMode.PIPELINING_DYNAMIC_WINDOW:
+            if pkt.type == PacketType.DATA:
+                self._pdw_on_data_received(pkt)
+            elif pkt.type == PacketType.ACK:
+                self._pdw_on_ack_received(pkt)
+            return
+
     def send(self, pkts):
         if self._mode == ReliabilityMode.NO_RELIABILITY:
             for pkt in pkts:
@@ -283,6 +434,10 @@ class Host(SimulatedEntity):
         elif self._mode == ReliabilityMode.PIPELINING_FIXED_WINDOW:
             self._pfw_app_queue.extend(pkts)
             self._pfw_fill_window()
+        
+        elif self._mode == ReliabilityMode.PIPELINING_DYNAMIC_WINDOW:
+            self._pdw_app_queue.extend(pkts)
+            self._pdw_fill_window()
 
         else:
             raise NotImplementedError('This reliability mode is not yet implemented.')
