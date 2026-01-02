@@ -2,7 +2,8 @@ from enum import Enum
 
 class PacketType(Enum):
     DATA = 'DATA'
-
+    ACK = 'ACK'
+    
 class Packet:
     
     def __init__(self, sn, size, type=PacketType.DATA):
