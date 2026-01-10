@@ -9,7 +9,7 @@ from Router import Router
 from Link import Link
 
 import random
-random.seed(2147483611)  # with this seed, the ACK for packet SN=10 is lost on Link L1
+random.seed(2147483611)  # with this seed, the DATA for packet SN=23 is dropped on Link L1
 
 import logging
 
